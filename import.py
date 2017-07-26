@@ -12,20 +12,16 @@ import datetime
 import json
 import logging
 import os
-import re
-import subprocess
-import tempfile
+from mtp import *
 import qif
 from decimal import Decimal
 
 from gnucash import Session, Transaction, Split, GncNumeric
 
-MTP_SCHEME = 'mtp:'
-
 
 def lookup_account_by_path(root, path):
     acc = root.lookup_by_name(path[0])
-    if acc.get_instance() == None:
+    if acc.get_instance() is None:
         raise Exception('Account path {} not found'.format(':'.join(path)))
     if len(path) > 1:
         return lookup_account_by_path(acc, path[1:])
@@ -38,10 +34,10 @@ def lookup_account(root, name):
 
 
 def add_transaction(book, item, currency):
-    logging.info('Adding transaction for account "%s" (%s %s)..', item.account, item.split_amount,
-                 currency.get_mnemonic())
-    root = book.get_root_account()
-    acc = lookup_account(root, item.account)
+    logging.info(
+        'Adding transaction for account "%s" (%s %s)..',
+        item.account, item.split_amount, currency.get_mnemonic()
+    )
 
     tx = Transaction(book)
     tx.BeginEdit()
@@ -50,60 +46,29 @@ def add_transaction(book, item, currency):
     tx.SetDatePostedTS(item.date)
     tx.SetDescription(item.memo)
 
-    s1 = Split(book)
-    s1.SetParent(tx)
-    s1.SetAccount(acc)
-    amount = int(Decimal(item.split_amount.replace(',', '.')) * currency.get_fraction())
-    s1.SetValue(GncNumeric(amount, currency.get_fraction()))
-    s1.SetAmount(GncNumeric(amount, currency.get_fraction()))
+    root = book.get_root_account()
+    acc = lookup_account(root, item.account)
+    add_split(book, acc, tx, to_gnc_numeric(item, currency))
 
     acc2 = lookup_account(root, item.split_category)
-    s2 = Split(book)
-    s2.SetParent(tx)
-    s2.SetAccount(acc2)
-    s2.SetValue(GncNumeric(amount * -1, currency.get_fraction()))
-    s2.SetAmount(GncNumeric(amount * -1, currency.get_fraction()))
+    add_split(book, acc2, tx, to_gnc_numeric(item, currency, -1))
 
     tx.CommitEdit()
 
 
-def read_entries_from_mtp_file(file_id, filename):
-    with tempfile.NamedTemporaryFile(suffix=filename) as fd:
-        subprocess.check_call(['mtp-getfile', file_id, fd.name])
-        entries_from_qif = qif.parse_qif(fd)
-    logging.debug('Read %s entries from %s', len(entries_from_qif), filename)
-    return entries_from_qif
+def add_split(book, account, transaction, amount):
+    split = Split(book)
+    split.SetParent(transaction)
+    split.SetAccount(account)
+    split.SetValue(amount)
+    split.SetAmount(amount)
 
 
-def get_mtp_files():
-    '''list all files on MTP device and return a tuple (file_id, filename) for each file'''
+def to_gnc_numeric(item, currency, positive=1):
+    item_amount = Decimal(item.split_amount.replace(',', '.'))
+    amount = int(item_amount * currency.get_fraction())
 
-    # using mtp-tools instead of pymtp because I could not get pymtp to work (always got segmentation fault!)
-    out = subprocess.check_output('mtp-files 2>&1', shell=True)
-    last_file_id = None
-    for line in out.splitlines():
-        cols = line.strip().split(':', 1)
-        if len(cols) == 2:
-            key, val = cols
-            if key.lower() == 'file id':
-                last_file_id = val.strip()
-            elif key.lower() == 'filename':
-                filename = val.strip()
-                yield (last_file_id, filename)
-
-
-def read_entries_from_mtp(pattern, imported):
-    entries = []
-    regex = re.compile(pattern)
-    for file_id, filename in get_mtp_files():
-        if regex.match(filename):
-            logging.debug('Found matching file on MTP device: "%s" (ID: %s)', filename, file_id)
-            if filename in imported:
-                logging.info('Skipping %s (already imported)', filename)
-            else:
-                entries.extend(read_entries_from_mtp_file(file_id, filename))
-                imported.add(filename)
-    return entries
+    return GncNumeric(amount * positive, currency.get_fraction())
 
 
 def read_entries(fn, imported):
@@ -122,8 +87,28 @@ def read_entries(fn, imported):
     return items
 
 
+def item_already_in_book(book, item, currency):
+    '''Find transaction by description than check date and amount'''
+
+    root = book.get_root_account()
+    acc = lookup_account(root, item.account)
+
+    transaction = acc.FindTransByDesc(item.memo)
+    if not transaction:
+        return False
+
+    tx_date = datetime.datetime.fromtimestamp(transaction.GetDate())
+    if tx_date.strftime('%Y-%m-%d') != item.date.strftime('%Y-%m-%d'):
+        return False
+
+    tx_amount = transaction.GetAccountAmount(acc)
+
+    return tx_amount.equal(to_gnc_numeric(item, currency))
+
+
 def write_transactions_to_gnucash(gnucash_file, currency, all_items, dry_run=False, date_from=None):
     logging.debug('Opening GnuCash file %s..', gnucash_file)
+
     session = Session(gnucash_file)
     book = session.book
     commod_tab = book.get_table()
@@ -137,7 +122,7 @@ def write_transactions_to_gnucash(gnucash_file, currency, all_items, dry_run=Fal
         if date_from and item.date < date_from:
             logging.info('Skipping entry %s (%s)', item.date.strftime('%Y-%m-%d'), item.split_amount)
             continue
-        if item.as_tuple() in imported_items:
+        if item_already_in_book(book, item, currency) or (item.as_tuple() in imported_items):
             logging.info('Skipping entry %s (%s) --- already imported!', item.date.strftime('%Y-%m-%d'),
                          item.split_amount)
             continue
@@ -195,4 +180,3 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     main(args)
-
